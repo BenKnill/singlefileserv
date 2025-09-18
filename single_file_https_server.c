@@ -3,22 +3,18 @@
 // No public CA / Let's Encrypt needed. Good for demos, local dev, or
 // controlled environments where you accept a self-signed cert.
 //
-// Default behavior: serve HTTPS, but DO NOT print or write the private key by default.
-// You can optionally write PEM files via --write-pem <prefix>.
-//
 // Build (Linux/macOS):
 //   gcc -O2 -Wall -Wextra -o https_server single_file_https_server.c -lssl -lcrypto
 //
 // Usage:
 //   ./https_server [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]
 //                  [--valid-days D] [--write-pem PREFIX]
-//                  [--print-cert] [--print-key]
 //
 // Examples:
-//   ./https_server                                 # :8443, SANs: localhost,127.0.0.1,::1
-//   ./https_server --port 8443 --san 38.80.152.249 # add public IP SAN to avoid name mismatch
-//   ./https_server --addr 0.0.0.0 --port 443       # bind privileged port (needs caps/root)
-//   ./https_server --write-pem server              # writes server.crt and server.key with 0600
+//   ./https_server                              // :8443, SANs: localhost,127.0.0.1,::1
+//   ./https_server --port 8443 --san 203.0.113.10
+//   ./https_server --addr 0.0.0.0 --port 443   // requires root or setcap on Linux
+//   ./https_server --write-pem server          // writes server.crt and server.key (0600)
 //
 // NOTE: single-threaded, blocking, tiny HTTP/1.1 responder ("Hello" + /health).
 
@@ -59,11 +55,9 @@ static int create_listen_socket(const char *bind_ip, uint16_t port) {
     if (fd < 0) die("socket");
 
     int on = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
-        die("setsockopt SO_REUSEADDR");
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 #ifdef SO_REUSEPORT
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0)
-        ; // ignore failures
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
 #endif
 
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
@@ -75,12 +69,9 @@ static int create_listen_socket(const char *bind_ip, uint16_t port) {
     }
     addr.sin_port = htons(port);
 
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
-        die("bind");
-    if (listen(fd, 64) < 0)
-        die("listen");
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) die("bind");
+    if (listen(fd, 64) < 0) die("listen");
 
-    // Set TCP_NODELAY for snappier writes (optional)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
     return fd;
 }
@@ -164,27 +155,6 @@ end:
     return ret;
 }
 
-static int pem_to_memory(EVP_PKEY *pkey, X509 *cert, unsigned char **crt_buf, size_t *crt_len,
-                         unsigned char **key_buf, size_t *key_len) {
-    BIO *bio_crt = BIO_new(BIO_s_mem());
-    BIO *bio_key = BIO_new(BIO_s_mem());
-    if (!bio_crt || !bio_key) goto end;
-
-    if (!PEM_write_bio_X509(bio_crt, cert)) goto end;
-    if (!PEM_write_bio_PrivateKey(bio_key, pkey, NULL, NULL, 0, NULL, NULL)) goto end;
-
-    *crt_len = BIO_get_mem_data(bio_crt, crt_buf);
-    *key_len = BIO_get_mem_data(bio_key, key_buf);
-    // NOTE: The returned pointers are internal to BIO buffers; we will copy them before BIO_free.
-
-    BIO_free(bio_crt); BIO_free(bio_key);
-    return 1;
-end:
-    if (bio_crt) BIO_free(bio_crt);
-    if (bio_key) BIO_free(bio_key);
-    return 0;
-}
-
 static char *build_sans_from_args(int san_count, char **sans_vals) {
     // Always include localhost/loopbacks
     const char *base = "DNS:localhost,IP:127.0.0.1,IP:::1";
@@ -209,15 +179,9 @@ static void http_date(char *out, size_t n) {
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr,
-        "Usage: %s [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]
-"
-        "           [--valid-days D] [--write-pem PREFIX] [--print-cert] [--print-key]
-"
-        "
-Defaults: --port 8443, --addr 0.0.0.0, --cn localhost, SANs include localhost,127.0.0.1,::1
-",
-        argv0);
+    fprintf(stderr, "Usage: %s [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]\n", argv0);
+    fprintf(stderr, "           [--valid-days D] [--write-pem PREFIX]\n");
+    fprintf(stderr, "Defaults: --port 8443, --addr 0.0.0.0, --cn localhost; SANs always include localhost,127.0.0.1,::1\n");
 }
 
 int main(int argc, char **argv) {
@@ -227,7 +191,6 @@ int main(int argc, char **argv) {
     const char *cn = "localhost";
     int valid_days = 365*5;
     const char *pem_prefix = NULL;
-    bool print_cert = false, print_key = false;
 
     // Basic arg parsing
     int i = 1; int san_count = 0; char *san_vals[64];
@@ -241,11 +204,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--san") && i+1 < argc && san_count < 64) { san_vals[san_count++] = argv[++i]; }
         else if (!strcmp(argv[i], "--valid-days") && i+1 < argc) { valid_days = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--write-pem") && i+1 < argc) { pem_prefix = argv[++i]; }
-        else if (!strcmp(argv[i], "--print-cert")) { print_cert = true; }
-        else if (!strcmp(argv[i], "--print-key")) { print_key = true; }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "Unknown arg: %s
-", argv[i]); usage(argv[0]); return 1; }
+        else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
         ++i;
     }
 
@@ -254,70 +214,55 @@ int main(int argc, char **argv) {
     SSL_load_error_strings();
 
     char *sans = build_sans_from_args(san_count, san_vals);
-    if (!sans) { fprintf(stderr, "Out of memory building SANs.
-"); return 1; }
+    if (!sans) { fprintf(stderr, "Out of memory building SANs.\n"); return 1; }
 
     EVP_PKEY *pkey = NULL; X509 *cert = NULL;
     if (!create_self_signed(&pkey, &cert, cn, sans, valid_days)) {
-        fprintf(stderr, "Failed to create self-signed cert.
-");
+        fprintf(stderr, "Failed to create self-signed cert.\n");
         free(sans);
         return 1;
     }
 
     // Optionally write PEMs to disk (0600)
     if (pem_prefix) {
-        unsigned char *crt_mem = NULL, *key_mem = NULL; size_t crt_len = 0, key_len = 0;
         BIO *bio_crt = BIO_new(BIO_s_mem());
         BIO *bio_key = BIO_new(BIO_s_mem());
         if (!bio_crt || !bio_key) die("BIO_new");
         if (!PEM_write_bio_X509(bio_crt, cert)) die("write crt");
         if (!PEM_write_bio_PrivateKey(bio_key, pkey, NULL, NULL, 0, NULL, NULL)) die("write key");
-        size_t n1 = BIO_get_mem_data(bio_crt, &crt_mem);
-        size_t n2 = BIO_get_mem_data(bio_key, &key_mem);
+        unsigned char *crt_mem = NULL, *key_mem = NULL; long n1 = BIO_get_mem_data(bio_crt, &crt_mem); long n2 = BIO_get_mem_data(bio_key, &key_mem);
         char crt_path[512], key_path[512];
         snprintf(crt_path, sizeof(crt_path), "%s.crt", pem_prefix);
         snprintf(key_path, sizeof(key_path), "%s.key", pem_prefix);
-        if (!write_file_0600(crt_path, crt_mem, n1)) die("write crt file");
-        if (!write_file_0600(key_path, key_mem, n2)) die("write key file");
+        if (!write_file_0600(crt_path, crt_mem, (size_t)n1)) die("write crt file");
+        if (!write_file_0600(key_path, key_mem, (size_t)n2)) die("write key file");
         BIO_free(bio_crt); BIO_free(bio_key);
-        fprintf(stderr, "Wrote %s and %s (0600)
-", crt_path, key_path);
-    }
-
-    // Optionally print PEMs to stdout
-    if (print_cert) {
-        PEM_write_X509(stdout, cert);
-    }
-    if (print_key) {
-        PEM_write_PrivateKey(stdout, pkey, NULL, NULL, 0, NULL, NULL);
+        fprintf(stderr, "Wrote %s and %s (0600)\n", crt_path, key_path);
     }
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) die("SSL_CTX_new");
+#ifdef SSL_CTX_set_ecdh_auto
     SSL_CTX_set_ecdh_auto(ctx, 1);
+#endif
+#ifdef TLS1_2_VERSION
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+#endif
 
     if (SSL_CTX_use_certificate(ctx, cert) != 1) die("use cert");
     if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1) die("use key");
     if (SSL_CTX_check_private_key(ctx) != 1) die("key check");
 
-    free(sans);
+    // cert/key no longer needed by us after loaded into ctx
     X509_free(cert);
     EVP_PKEY_free(pkey);
+    free(sans);
 
     int listen_fd = create_listen_socket(bind_ip, port);
-    printf("HTTPS listening on https://%s:%u (Ctrl+C to stop)
-", bind_ip, port);
+    printf("HTTPS listening on https://%s:%u (Ctrl+C to stop)\n", bind_ip, port);
 
-    // Prepare a tiny HTTP response
-    const char *body = "Hello from a single-file HTTPS server!
-";
-    char datebuf[64]; http_date(datebuf, sizeof(datebuf));
-    char resp[1024];
-    int body_len = (int)strlen(body);
+    const char *body = "Hello from a single-file HTTPS server!\n";
 
-    // Main accept loop
     while (g_keep_running) {
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
         int fd = accept(listen_fd, (struct sockaddr*)&cli, &clilen);
@@ -337,6 +282,41 @@ int main(int argc, char **argv) {
             SSL_free(ssl); close(fd); continue;
         }
 
-        // Read a bit of the request (very small, just to distinguish /health)
         char buf[2048]; int n = SSL_read(ssl, buf, sizeof(buf)-1);
-        if (n < 0) n = 0; buf[n] = '
+        if (n < 0) n = 0; buf[n] = '\0';
+        bool is_health = (n >= 12 && strstr(buf, "GET /health") == buf);
+
+        char datebuf[64]; http_date(datebuf, sizeof(datebuf));
+        char resp[1024];
+        if (is_health) {
+            const char *hbody = "OK\n";
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Date: %s\r\n"
+                "Server: single-file-https/1\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: close\r\n\r\n%s",
+                datebuf, strlen(hbody), hbody);
+        } else {
+            int body_len = (int)strlen(body);
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Date: %s\r\n"
+                "Server: single-file-https/1\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n\r\n%s",
+                datebuf, body_len, body);
+        }
+
+        SSL_write(ssl, resp, (int)strlen(resp));
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(fd);
+    }
+
+    close(listen_fd);
+    SSL_CTX_free(ctx);
+    return 0;
+}
