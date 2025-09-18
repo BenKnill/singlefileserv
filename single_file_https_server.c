@@ -179,9 +179,12 @@ static void http_date(char *out, size_t n) {
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]\n", argv0);
-    fprintf(stderr, "           [--valid-days D] [--write-pem PREFIX]\n");
-    fprintf(stderr, "Defaults: --port 8443, --addr 0.0.0.0, --cn localhost; SANs always include localhost,127.0.0.1,::1\n");
+    fprintf(stderr, "Usage: %s [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]
+", argv0);
+    fprintf(stderr, "           [--valid-days D] [--write-pem PREFIX]
+");
+    fprintf(stderr, "Defaults: --port 8443, --addr 0.0.0.0, --cn localhost; SANs always include localhost,127.0.0.1,::1
+");
 }
 
 int main(int argc, char **argv) {
@@ -205,7 +208,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--valid-days") && i+1 < argc) { valid_days = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--write-pem") && i+1 < argc) { pem_prefix = argv[++i]; }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
+        else { fprintf(stderr, "Unknown arg: %s
+", argv[i]); usage(argv[0]); return 1; }
         ++i;
     }
 
@@ -214,11 +218,13 @@ int main(int argc, char **argv) {
     SSL_load_error_strings();
 
     char *sans = build_sans_from_args(san_count, san_vals);
-    if (!sans) { fprintf(stderr, "Out of memory building SANs.\n"); return 1; }
+    if (!sans) { fprintf(stderr, "Out of memory building SANs.
+"); return 1; }
 
     EVP_PKEY *pkey = NULL; X509 *cert = NULL;
     if (!create_self_signed(&pkey, &cert, cn, sans, valid_days)) {
-        fprintf(stderr, "Failed to create self-signed cert.\n");
+        fprintf(stderr, "Failed to create self-signed cert.
+");
         free(sans);
         return 1;
     }
@@ -237,7 +243,8 @@ int main(int argc, char **argv) {
         if (!write_file_0600(crt_path, crt_mem, (size_t)n1)) die("write crt file");
         if (!write_file_0600(key_path, key_mem, (size_t)n2)) die("write key file");
         BIO_free(bio_crt); BIO_free(bio_key);
-        fprintf(stderr, "Wrote %s and %s (0600)\n", crt_path, key_path);
+        fprintf(stderr, "Wrote %s and %s (0600)
+", crt_path, key_path);
     }
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
@@ -259,9 +266,11 @@ int main(int argc, char **argv) {
     free(sans);
 
     int listen_fd = create_listen_socket(bind_ip, port);
-    printf("HTTPS listening on https://%s:%u (Ctrl+C to stop)\n", bind_ip, port);
+    printf("HTTPS listening on https://%s:%u (Ctrl+C to stop)
+", bind_ip, port);
 
-    const char *body = "Hello from a single-file HTTPS server!\n";
+    const char *body = "Hello from a single-file HTTPS server!
+";
 
     while (g_keep_running) {
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
@@ -282,41 +291,9 @@ int main(int argc, char **argv) {
             SSL_free(ssl); close(fd); continue;
         }
 
-        char buf[2048]; int n = SSL_read(ssl, buf, sizeof(buf)-1);
-        if (n < 0) n = 0; buf[n] = '\0';
-        bool is_health = (n >= 12 && strstr(buf, "GET /health") == buf);
-
-        char datebuf[64]; http_date(datebuf, sizeof(datebuf));
-        char resp[1024];
-        if (is_health) {
-            const char *hbody = "OK\n";
-            snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Date: %s\r\n"
-                "Server: single-file-https/1\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n\r\n%s",
-                datebuf, strlen(hbody), hbody);
-        } else {
-            int body_len = (int)strlen(body);
-            snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Date: %s\r\n"
-                "Server: single-file-https/1\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: close\r\n\r\n%s",
-                datebuf, body_len, body);
+        char buf[2048];
+        int n = SSL_read(ssl, buf, sizeof(buf) - 1);
+        if (n < 0) {
+            n = 0;
         }
-
-        SSL_write(ssl, resp, (int)strlen(resp));
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        close(fd);
-    }
-
-    close(listen_fd);
-    SSL_CTX_free(ctx);
-    return 0;
-}
+        buf[n] = '
