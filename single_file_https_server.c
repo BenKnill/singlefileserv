@@ -1,27 +1,12 @@
 // single_file_https_server.c
-// Minimal single-file HTTPS server with runtime self-signed cert.
-// No public CA / Let's Encrypt needed. Good for demos, local dev, or
-// controlled environments where you accept a self-signed cert.
-//
-// Build (Linux/macOS):
-//   gcc -O2 -Wall -Wextra -o https_server single_file_https_server.c -lssl -lcrypto
-//
-// Usage:
-//   ./https_server [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]
-//                  [--valid-days D] [--write-pem PREFIX]
-//
-// Examples:
-//   ./https_server                              // :8443, SANs: localhost,127.0.0.1,::1
-//   ./https_server --port 8443 --san 203.0.113.10
-//   ./https_server --addr 0.0.0.0 --port 443   // requires root or setcap on Linux
-//   ./https_server --write-pem server          // writes server.crt and server.key (0600)
-//
-// NOTE: single-threaded, blocking, tiny HTTP/1.1 responder ("Hello" + /health).
+// Minimal single-file HTTPS server with a runtime self-signed certificate.
+// Build: gcc -O2 -Wall -Wextra -o https_server single_file_https_server.c -lssl -lcrypto
+// Usage: ./https_server --port 8443 --san 203.0.113.10
+// Notes: single-threaded, blocking; for demos/dev. Browsers will warn on self-signed certs.
 
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -30,8 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -45,42 +28,38 @@
 static volatile sig_atomic_t g_keep_running = 1;
 static void handle_sigint(int signo) { (void)signo; g_keep_running = 0; }
 
-static void die(const char *msg) {
-    perror(msg);
-    exit(EXIT_FAILURE);
+static void die(const char *msg) { perror(msg); exit(EXIT_FAILURE); }
+
+static void http_date(char *out, size_t n) {
+    time_t t = time(NULL); struct tm gm;
+    gmtime_r(&t, &gm);
+    strftime(out, n, "%a, %d %b %Y %H:%M:%S GMT", &gm);
 }
 
 static int create_listen_socket(const char *bind_ip, uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) die("socket");
-
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 #ifdef SO_REUSEPORT
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
 #endif
-
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    if (bind_ip && inet_pton(AF_INET, bind_ip, &addr.sin_addr) == 1) {
-        // ok
-    } else {
+    if (!bind_ip || inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1)
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    }
     addr.sin_port = htons(port);
-
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) die("bind");
     if (listen(fd, 64) < 0) die("listen");
-
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
     return fd;
 }
 
-static X509_NAME *dn(const char *common_name) {
+static X509_NAME *mk_name(const char *cn) {
     X509_NAME *name = X509_NAME_new();
     if (!name) return NULL;
     X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (const unsigned char*)"SingleFileHTTPS", -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char*)common_name, -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char*)cn, -1, -1, 0);
     return name;
 }
 
@@ -94,157 +73,101 @@ static int add_ext(X509 *cert, int nid, const char *value) {
     return ok;
 }
 
-static bool is_ip_literal(const char *s) {
+static bool is_ip(const char *s) {
     struct in6_addr a6; struct in_addr a4;
     return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
 }
 
-static int write_file_0600(const char *path, const unsigned char *data, size_t len) {
-    int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0600);
-    if (fd < 0) return 0;
-    ssize_t w = write(fd, data, len);
-    close(fd);
-    return w == (ssize_t)len;
-}
-
-// Creates a 2048-bit RSA key and a self-signed X.509 certificate.
-static int create_self_signed(EVP_PKEY **out_pkey, X509 **out_cert,
-                              const char *common_name, const char *sans,
-                              int valid_days) {
-    int ret = 0;
-    EVP_PKEY *pkey = NULL; X509 *x509 = NULL; RSA *rsa = NULL; BIGNUM *e = NULL;
-
-    pkey = EVP_PKEY_new();
-    if (!pkey) goto end;
-
-    rsa = RSA_new(); e = BN_new(); if (!rsa || !e) goto end;
-    if (!BN_set_word(e, RSA_F4)) goto end;
-    if (!RSA_generate_key_ex(rsa, 2048, e, NULL)) goto end;
-    if (!EVP_PKEY_assign_RSA(pkey, rsa)) goto end; // pkey owns rsa now
-    rsa = NULL;
-
-    x509 = X509_new();
-    if (!x509) goto end;
-
-    ASN1_INTEGER_set(X509_get_serialNumber(x509), (long)time(NULL));
-    X509_gmtime_adj(X509_getm_notBefore(x509), 0);
-    X509_gmtime_adj(X509_getm_notAfter(x509), 60L*60*24*valid_days);
-    X509_set_pubkey(x509, pkey);
-
-    X509_NAME *name = dn(common_name);
-    if (!name) goto end;
-    X509_set_subject_name(x509, name);
-    X509_set_issuer_name(x509, name);
-    X509_NAME_free(name);
-
-    if (!add_ext(x509, NID_basic_constraints, "CA:FALSE")) goto end;
-    if (!add_ext(x509, NID_key_usage, "digitalSignature,keyEncipherment")) goto end;
-    if (!add_ext(x509, NID_ext_key_usage, "serverAuth")) goto end;
-    if (!add_ext(x509, NID_subject_alt_name, sans)) goto end;
-
-    if (!X509_sign(x509, pkey, EVP_sha256())) goto end;
-
-    *out_pkey = pkey; *out_cert = x509; pkey = NULL; x509 = NULL;
-    ret = 1;
-
-end:
-    if (rsa) RSA_free(rsa);
-    if (e) BN_free(e);
-    if (pkey) EVP_PKEY_free(pkey);
-    if (x509) X509_free(x509);
-    return ret;
-}
-
-static char *build_sans_from_args(int san_count, char **sans_vals) {
-    // Always include localhost/loopbacks
+static char *build_sans(int n, char **vals) {
     const char *base = "DNS:localhost,IP:127.0.0.1,IP:::1";
-    size_t cap = 256 + (size_t)san_count * 128;
+    size_t cap = 256 + (size_t)n * 128;
     char *buf = (char*)malloc(cap);
     if (!buf) return NULL;
     snprintf(buf, cap, "%s", base);
-    for (int i = 0; i < san_count; ++i) {
-        const char *a = sans_vals[i];
+    for (int i = 0; i < n; ++i) {
+        const char *a = vals[i];
         strncat(buf, ",", cap - strlen(buf) - 1);
-        if (is_ip_literal(a)) strncat(buf, "IP:", cap - strlen(buf) - 1);
-        else                  strncat(buf, "DNS:", cap - strlen(buf) - 1);
+        strncat(buf, is_ip(a) ? "IP:" : "DNS:", cap - strlen(buf) - 1);
         strncat(buf, a, cap - strlen(buf) - 1);
     }
     return buf;
 }
 
-static void http_date(char *out, size_t n) {
-    time_t t = time(NULL); struct tm gm;
-    gmtime_r(&t, &gm);
-    strftime(out, n, "%a, %d %b %Y %H:%M:%S GMT", &gm);
+static int make_self_signed(EVP_PKEY **out_key, X509 **out_crt,
+                            const char *cn, const char *sans, int valid_days) {
+    int ok = 0;
+    EVP_PKEY *pkey = EVP_PKEY_new(); X509 *crt = X509_new();
+    RSA *rsa = RSA_new(); BIGNUM *e = BN_new();
+    if (!pkey || !crt || !rsa || !e) goto done;
+    if (!BN_set_word(e, RSA_F4)) goto done;
+    if (!RSA_generate_key_ex(rsa, 2048, e, NULL)) goto done;
+    if (!EVP_PKEY_assign_RSA(pkey, rsa)) goto done; // pkey owns rsa now
+    rsa = NULL;
+
+    ASN1_INTEGER_set(X509_get_serialNumber(crt), (long)time(NULL));
+    X509_gmtime_adj(X509_getm_notBefore(crt), 0);
+    X509_gmtime_adj(X509_getm_notAfter(crt), 60L*60*24*valid_days);
+    X509_set_pubkey(crt, pkey);
+
+    X509_NAME *name = mk_name(cn ? cn : "localhost");
+    if (!name) goto done;
+    X509_set_subject_name(crt, name);
+    X509_set_issuer_name(crt, name);
+    X509_NAME_free(name);
+
+    if (!add_ext(crt, NID_basic_constraints, "CA:FALSE")) goto done;
+    if (!add_ext(crt, NID_key_usage, "digitalSignature,keyEncipherment")) goto done;
+    if (!add_ext(crt, NID_ext_key_usage, "serverAuth")) goto done;
+    if (!add_ext(crt, NID_subject_alt_name, sans)) goto done;
+
+    if (!X509_sign(crt, pkey, EVP_sha256())) goto done;
+
+    *out_key = pkey; *out_crt = crt; pkey = NULL; crt = NULL; ok = 1;
+
+done:
+    if (rsa) RSA_free(rsa);
+    if (e) BN_free(e);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (crt) X509_free(crt);
+    return ok;
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]
-", argv0);
-    fprintf(stderr, "           [--valid-days D] [--write-pem PREFIX]
-");
-    fprintf(stderr, "Defaults: --port 8443, --addr 0.0.0.0, --cn localhost; SANs always include localhost,127.0.0.1,::1
-");
+    fprintf(stderr, "Usage: %s [--port N] [--addr IP] [--cn NAME] [--san VALUE ...]\n", argv0);
+    fprintf(stderr, "Defaults: --port 8443, --addr 0.0.0.0, --cn localhost; SANs include localhost,127.0.0.1,::1\n");
 }
 
 int main(int argc, char **argv) {
-    // Defaults
     const char *bind_ip = "0.0.0.0";
     uint16_t port = 8443;
     const char *cn = "localhost";
     int valid_days = 365*5;
-    const char *pem_prefix = NULL;
 
-    // Basic arg parsing
-    int i = 1; int san_count = 0; char *san_vals[64];
+    int i = 1, san_count = 0; char *san_vals[64];
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_sigint);
 
     while (i < argc) {
-        if (!strcmp(argv[i], "--port") && i+1 < argc) { port = (uint16_t)atoi(argv[++i]); }
-        else if (!strcmp(argv[i], "--addr") && i+1 < argc) { bind_ip = argv[++i]; }
-        else if (!strcmp(argv[i], "--cn") && i+1 < argc) { cn = argv[++i]; }
+        if (!strcmp(argv[i], "--port") && i+1 < argc)      { port = (uint16_t)atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--addr") && i+1 < argc)  { bind_ip = argv[++i]; }
+        else if (!strcmp(argv[i], "--cn") && i+1 < argc)    { cn = argv[++i]; }
         else if (!strcmp(argv[i], "--san") && i+1 < argc && san_count < 64) { san_vals[san_count++] = argv[++i]; }
-        else if (!strcmp(argv[i], "--valid-days") && i+1 < argc) { valid_days = atoi(argv[++i]); }
-        else if (!strcmp(argv[i], "--write-pem") && i+1 < argc) { pem_prefix = argv[++i]; }
-        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "Unknown arg: %s
-", argv[i]); usage(argv[0]); return 1; }
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
+        else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
         ++i;
     }
 
-    // Initialize OpenSSL
     OPENSSL_init_ssl(0, NULL);
     SSL_load_error_strings();
 
-    char *sans = build_sans_from_args(san_count, san_vals);
-    if (!sans) { fprintf(stderr, "Out of memory building SANs.
-"); return 1; }
+    char *sans = build_sans(san_count, san_vals);
+    if (!sans) { fprintf(stderr, "Out of memory building SANs.\n"); return 1; }
 
-    EVP_PKEY *pkey = NULL; X509 *cert = NULL;
-    if (!create_self_signed(&pkey, &cert, cn, sans, valid_days)) {
-        fprintf(stderr, "Failed to create self-signed cert.
-");
+    EVP_PKEY *key = NULL; X509 *crt = NULL;
+    if (!make_self_signed(&key, &crt, cn, sans, valid_days)) {
+        fprintf(stderr, "Failed to create self-signed cert.\n");
         free(sans);
         return 1;
-    }
-
-    // Optionally write PEMs to disk (0600)
-    if (pem_prefix) {
-        BIO *bio_crt = BIO_new(BIO_s_mem());
-        BIO *bio_key = BIO_new(BIO_s_mem());
-        if (!bio_crt || !bio_key) die("BIO_new");
-        if (!PEM_write_bio_X509(bio_crt, cert)) die("write crt");
-        if (!PEM_write_bio_PrivateKey(bio_key, pkey, NULL, NULL, 0, NULL, NULL)) die("write key");
-        unsigned char *crt_mem = NULL, *key_mem = NULL; long n1 = BIO_get_mem_data(bio_crt, &crt_mem); long n2 = BIO_get_mem_data(bio_key, &key_mem);
-        char crt_path[512], key_path[512];
-        snprintf(crt_path, sizeof(crt_path), "%s.crt", pem_prefix);
-        snprintf(key_path, sizeof(key_path), "%s.key", pem_prefix);
-        if (!write_file_0600(crt_path, crt_mem, (size_t)n1)) die("write crt file");
-        if (!write_file_0600(key_path, key_mem, (size_t)n2)) die("write key file");
-        BIO_free(bio_crt); BIO_free(bio_key);
-        fprintf(stderr, "Wrote %s and %s (0600)
-", crt_path, key_path);
     }
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
@@ -255,22 +178,15 @@ int main(int argc, char **argv) {
 #ifdef TLS1_2_VERSION
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 #endif
-
-    if (SSL_CTX_use_certificate(ctx, cert) != 1) die("use cert");
-    if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1) die("use key");
+    if (SSL_CTX_use_certificate(ctx, crt) != 1) die("use cert");
+    if (SSL_CTX_use_PrivateKey(ctx, key) != 1) die("use key");
     if (SSL_CTX_check_private_key(ctx) != 1) die("key check");
-
-    // cert/key no longer needed by us after loaded into ctx
-    X509_free(cert);
-    EVP_PKEY_free(pkey);
-    free(sans);
+    X509_free(crt); EVP_PKEY_free(key); free(sans);
 
     int listen_fd = create_listen_socket(bind_ip, port);
-    printf("HTTPS listening on https://%s:%u (Ctrl+C to stop)
-", bind_ip, port);
+    printf("HTTPS listening on https://%s:%u (Ctrl+C to stop)\n", bind_ip, port);
 
-    const char *body = "Hello from a single-file HTTPS server!
-";
+    const char *body = "Hello from a single-file HTTPS server!\n";
 
     while (g_keep_running) {
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
@@ -293,7 +209,42 @@ int main(int argc, char **argv) {
 
         char buf[2048];
         int n = SSL_read(ssl, buf, sizeof(buf) - 1);
-        if (n < 0) {
-            n = 0;
+        if (n < 0) { n = 0; }
+        buf[n] = '\0';
+
+        bool is_health = (n >= 12 && strstr(buf, "GET /health") == buf);
+
+        char datebuf[64]; http_date(datebuf, sizeof(datebuf));
+        char resp[1024];
+        if (is_health) {
+            const char *ok = "OK\n";
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Date: %s\r\n"
+                "Server: single-file-https/1\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: close\r\n\r\n%s",
+                datebuf, strlen(ok), ok);
+        } else {
+            int blen = (int)strlen(body);
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Date: %s\r\n"
+                "Server: single-file-https/1\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n\r\n%s",
+                datebuf, blen, body);
         }
-        buf[n] = '
+
+        SSL_write(ssl, resp, (int)strlen(resp));
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(fd);
+    }
+
+    close(listen_fd);
+    SSL_CTX_free(ctx);
+    return 0;
+}
